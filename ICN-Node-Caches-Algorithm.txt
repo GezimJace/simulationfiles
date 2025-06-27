@@ -1,0 +1,98 @@
+Algorithm: ICN_Node_Caches
+Data Structures:
+  - ContentStore: cache with capacity C
+  - PIT: map<content_id → list of requester faces>
+  - FIB: map<content_id → next_hop face>
+  - CMS: Count-Min Sketch
+  - SLRU: Segmented LRU manager
+  - neighbors: set of adjacent ICN nodes
+  - θ_cache: map<content_id → float in [0,1]>  // per-content cache prob
+  - θ_forward: global forwarding probability
+
+  - AccessCounter: map<content_id → integer>  // since last report
+  - LastReport: map<content_id → integer>     // snapshot of last counts
+  - τ_report: periodic interval for reporting (e.g., every 30 min)
+-----------------------------------------------------------
+Procedure: OnReceive(packet)
+  if packet.type == INTEREST then
+    HandleInterest(packet)
+  else if packet.type == DATA then
+    HandleData(packet)
+  else if packet.type == FOG_INSTRUCTION then
+    ReceiveFogInstruction(packet.content_id, packet.cache_probability)
+------------------------------------------------------------
+Procedure: HandleInterest(interest)
+  content_id ← interest.name
+  AccessCounter[content_id] += 1
+
+  if content_id ∈ ContentStore then
+    Send DATA(ContentStore[content_id]) to interest.source
+  else if content_id ∈ PIT then
+    PIT[content_id].append(interest.source)
+  else
+    PIT[content_id] ← [interest.source]
+    next_hop ← FIB.lookup(content_id)
+    Forward INTEREST(content_id) to next_hop
+------------------------------------------------------------
+Procedure: HandleData(data)
+  content_id ← data.name
+
+  if content_id ∈ PIT then
+    for each requester ∈ PIT[content_id] do
+      Send DATA(data) to requester
+    PIT.remove(content_id)
+
+    CacheAndSpread(content_id, data)
+------------------------------------------------------------
+Procedure: CacheAndSpread(content_id, data)
+  CMS.increment(content_id)
+
+  p_cache ← θ_cache.get(content_id, default = 0.5)
+  if Random(0,1) < p_cache then
+    Estimate ← CMS.estimate(content_id)
+    if ContentStore.isFull() then
+      victim ← SLRU.selectEvictionCandidate()
+      if CMS.estimate(victim) < Estimate then
+        ContentStore.evict(victim)
+        SLRU.insert(content_id, data)
+      else
+        Skip caching
+    else
+      SLRU.insert(content_id, data)
+
+  if Random(0,1) < θ_forward then
+    for each neighbor ∈ neighbors do
+      neighbor.ReceiveProbabilisticPush(content_id, data)
+------------------------------------------------------------
+Procedure: ReceiveProbabilisticPush(content_id, data)
+  p_cache ← θ_cache.get(content_id, default = 0.5)
+
+  if Random(0,1) < p_cache then
+    CMS.increment(content_id)
+    Estimate ← CMS.estimate(content_id)
+
+    if ContentStore.isFull() then
+      victim ← SLRU.selectEvictionCandidate()
+      if CMS.estimate(victim) < Estimate then
+        ContentStore.evict(victim)
+        SLRU.insert(content_id, data)
+    else
+      SLRU.insert(content_id, data)
+------------------------------------------------------------
+Procedure: ReceiveFogInstruction(content_id, cache_probability)
+  θ_cache[content_id] ← cache_probability
+------------------------------------------------------------
+Procedure: PeriodicReportToFogNode()
+  Every τ_report time units do
+    delta_report ← {}
+    for each content_id in AccessCounter do
+      prev ← LastReport.get(content_id, default = 0)
+      current ← AccessCounter[content_id]
+      delta ← current - prev
+
+      if delta > 0 then
+        delta_report[content_id] ← delta
+        LastReport[content_id] ← current
+
+    if not delta_report.isEmpty() then
+      Send AccessReport(delta_report) to FogNode

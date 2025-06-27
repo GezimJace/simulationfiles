@@ -1,0 +1,62 @@
+Algorithm: Fog_Node_Controller
+Constants:
+  - k: Number of top popular content items to select
+  - α: Moving average decay factor ∈ (0,1)
+  - θ_high: Cache probability for predicted popular content
+  - θ_low: Cache probability for non-popular content
+  - τ: Time interval for periodic evaluation (e.g., 30 min)
+
+Data Structures:
+  - GlobalAccessLog: map<content_id → access_count>  // Running total
+  - NodeAccessMap: map<node_id → map<content_id → count>>  // For Top-k per node if needed
+  - ForecastScore: map<content_id → predicted value>
+  - ICN_Map: map<content_id → set of ICN node IDs that reported it in last τ>
+  - TopKList: list of top-k content_ids
+------------------------------------------------------------
+Procedure: OnReceive(packet)
+  if packet.type == ACCESS_REPORT then
+    HandleAccessReport(packet.sender_id, packet.access_counts)
+------------------------------------------------------------
+Procedure: HandleAccessReport(node_id, access_counts)
+  for each (content_id, count) in access_counts do
+    GlobalAccessLog[content_id] += count
+    NodeAccessMap[node_id][content_id] += count
+    ICN_Map[content_id].add(node_id)
+------------------------------------------------------------
+Procedure: PeriodicPrediction()
+  Every τ time units do
+    for each content_id in GlobalAccessLog do
+      history ← GlobalAccessLog[content_id]
+      ForecastScore[content_id] ← MovingAverage(history, α)
+
+    TopKList ← SelectTopK(ForecastScore, k)
+
+    for each content_id in TopKList do
+      for each node_id in ICN_Map[content_id] do
+        PushCacheInstruction(node_id, content_id, θ_high)
+
+    // Instruct other nodes to be less aggressive
+    all_nodes ← union of all node_ids in NodeAccessMap
+    for each node_id in all_nodes do
+      for each content_id in NodeAccessMap[node_id] do
+        if content_id not in TopKList then
+          PushCacheInstruction(node_id, content_id, θ_low)
+
+    // Reset temporary mappings
+    Clear ICN_Map
+------------------------------------------------------------
+Function: MovingAverage(count, α)
+  prev ← ForecastScore.get(content_id, default = count)
+  return α * count + (1 - α) * prev
+------------------------------------------------------------
+Function: SelectTopK(score_map, k)
+  return top-k content_ids with highest values in score_map
+------------------------------------------------------------
+Procedure: PushCacheInstruction(node_id, content_id, θ)
+  message ← {
+    type: FOG_INSTRUCTION,
+    content_id: content_id,
+    cache_probability: θ
+  }
+  Send message to node_id
+
