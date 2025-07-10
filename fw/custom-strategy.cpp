@@ -1,19 +1,108 @@
 // custom-strategy.cpp -------------------------------------------------
+// (Full implementation with metric‑gathering additions: cache & energy)
+// ‑‑ revised to use a shared CacheStats declared in cache‑stats.hpp (hits
+// & evictions are now updated inside slru.cpp; this file only counts
+// Interests).
 
 #include "custom-strategy.hpp"
+#include "cache-stats.hpp"          // <‑‑ new shared stats header
 
 #include "NFD/daemon/common/logger.hpp"
 #include <ndn-cxx/security/key-chain.hpp>
+#include <vector>
+#include <ns3/simulator.h>
+#include <ns3/node-list.h>
+#include <ns3/node.h>
+#include <ns3/basic-energy-source.h>
+
+// extra standard headers
+#include <cstdint>
+#include <fstream>
+#include <random>
+#include <algorithm>
 
 // ---------------------------------------------------------------------------
-//  Module‑wide constants
+//  Simple per‑operation energy model (anonymous namespace keeps symbols local)
+// ---------------------------------------------------------------------------
+namespace {
+// Per‑operation energy costs (arbitrary units; tune as needed)
+constexpr double E_INTEREST_RX  = 1.0;
+constexpr double E_INTEREST_TX  = 1.0;
+constexpr double E_DATA_RX      = 2.0;
+constexpr double E_DATA_TX      = 2.0;
+constexpr double E_CACHE_INSERT = 1.5;
+
+// Global vector indexed by ns‑3 NodeId (energy accounting)
+std::vector<double> g_nodeEnergy;
+
+// pull the shared statistics object into this TU
+using nfd::fw::g_cacheStats;
+
+// One‑time initializer that sizes the vector once nodes exist
+struct EnergyInit {
+  EnergyInit() {
+    uint32_t n = ns3::NodeList::GetNNodes();
+    g_nodeEnergy.resize(n, 0.0);
+  }
+} s_energyInit;
+
+// Helper – add energy to the current context/node
+constexpr double UNIT_TO_J = 0.005;          // tune as needed
+
+inline void addEnergy(double units)
+{
+  using namespace ns3;
+  uint32_t id = Simulator::GetContext();   // “current node id” for the event
+
+  /* 1. ensure the vector is big enough */
+  if (id >= g_nodeEnergy.size())
+    g_nodeEnergy.resize(id + 1, 0.0);
+
+  g_nodeEnergy[id] += units;
+
+  /* 2. drain the battery, if the node has one */
+  Ptr<Node> node = NodeList::GetNode(id);
+  if (!node)
+    return;
+
+  Ptr<BasicEnergySource> src = node->GetObject<BasicEnergySource>();
+  if (src)
+    src->ConsumeEnergy(units * UNIT_TO_J);
+}
+
+// -----------------------------------------------------------------------
+//  At‑end‑of‑simulation metric dump helper
+// -----------------------------------------------------------------------
+static void PrintMetrics()
+{
+
+  // 1. cache‑stats.txt
+  std::ofstream cs("metrics/cache-stats.txt");
+cs << "interests " << g_cacheStats.interests                     << '\n'
+   << "hits "      << g_cacheStats.hits                          << '\n'
+   << "misses "    << (g_cacheStats.interests - g_cacheStats.hits) << '\n'
+   << "evictions " << g_cacheStats.evictions                     << '\n';
+
+if (g_cacheStats.interests > 0) {
+  double hitRate = static_cast<double>(g_cacheStats.hits) / g_cacheStats.interests;
+  cs << "hitrate " << hitRate << '\n';          // 0.0 – 1.0
+} else {
+  cs << "hitrate 0\n";
+}
+
+}
+
+} // anonymous namespace (energy + metrics helpers)
+
+// ---------------------------------------------------------------------------
+//  Module‑wide TLV constants (kept in same anon‑namespace block)
 // ---------------------------------------------------------------------------
 namespace {
 constexpr uint32_t TLV_ACCESS_DELTA  = 0xF0;
 constexpr uint32_t TLV_ACCESS_VECTOR = 0xF1;
 constexpr uint32_t TLV_THETA_VECTOR  = 0xF2;
 constexpr uint32_t TLV_THETA_PAIR    = 0xF3;
-} // anonymous namespace
+} // anonymous namespace (TLVs)
 
 // ---------------------------------------------------------------------------
 //  Strategy registration boilerplate
@@ -21,6 +110,11 @@ constexpr uint32_t TLV_THETA_PAIR    = 0xF3;
 NFD_LOG_INIT(CustomStrategy);
 
 namespace nfd::fw {
+
+// -----------------------------------------------------------------------
+//  Shared statistics object – single definition lives here
+// -----------------------------------------------------------------------
+CacheStats g_cacheStats;
 
 const ndn::Name CustomStrategy::STRATEGY_NAME =
   ndn::Name("/localhost/nfd/strategy/custom").appendVersion(1);
@@ -39,12 +133,15 @@ CustomStrategy::getStrategyName()
 CustomStrategy::CustomStrategy(Forwarder& forwarder, const ndn::Name& name)
   : BestRouteStrategy(forwarder)
   , m_cms(4, 2048)          // 4 rows × 2 KiB each
-  , m_slru(100, 100)          // 50 probation + 50 protected
+  , m_slru(25, 25)           // 5 probation + 5 protected (total 10 entries)
   , m_rng(std::random_device{}())
   , m_uni(0.0, 1.0)
 {
   this->setInstanceName(name);
   scheduleNextReport();
+
+  // Dump metrics when the simulator terminates
+  ns3::Simulator::ScheduleDestroy(&PrintMetrics);
 }
 
 // ---------------------------------------------------------------------------
@@ -54,13 +151,19 @@ void CustomStrategy::afterReceiveInterest(const ndn::Interest&          interest
                                           const nfd::FaceEndpoint&      ingress,
                                           const std::shared_ptr<pit::Entry>& pitEntry)
 {
+  // Count every Interest arrival
+  ++g_cacheStats.interests;
+
+  // Energy: Interest Rx cost
+  addEnergy(E_INTEREST_RX);
+
   const ndn::Name& name = interest.getName();
 
   // 1. Serve from SLRU (cache hit)
   if (m_slru.contains(name)) {
     if (auto dataPtr = m_slru.fetch(name)) {
-      NFD_LOG_INFO("SLRU-HIT   " << name);
       this->sendData(*dataPtr, ingress.face, pitEntry);
+      addEnergy(E_DATA_TX);   // Tx energy for Data (hits counted inside slru.cpp)
     }
     return; // no upstream forwarding
   }
@@ -68,7 +171,8 @@ void CustomStrategy::afterReceiveInterest(const ndn::Interest&          interest
   // 2. Record Interest for periodic report
   ++m_accessCounter[name].total;
 
-  // 3. Default BestRoute handling (duplicate suppression + forwarding)
+  // 3. Forward upstream via BestRoute – count Tx energy
+  addEnergy(E_INTEREST_TX);
   BestRouteStrategy::afterReceiveInterest(interest, ingress, pitEntry);
 }
 
@@ -79,9 +183,12 @@ void CustomStrategy::beforeSatisfyInterest(const ndn::Data&                   da
                                            const nfd::FaceEndpoint&           ingress,
                                            const std::shared_ptr<pit::Entry>& pitEntry)
 {
+  // Energy: Data arriving from upstream
+  addEnergy(E_DATA_RX);
+
   const ndn::Name& name = data.getName();
 
-  // Control plane packets from the fog controller are never cached/forwarded
+  // Control‑plane packets from the fog controller are never cached/forwarded
   if (name.size() >= 2 && name.getSubName(0, 2) == ndn::Name("/fog/instruction")) {
     receiveFogInstruction(data);
     return;
@@ -89,7 +196,6 @@ void CustomStrategy::beforeSatisfyInterest(const ndn::Data&                   da
 
   // 1. Update frequency sketch
   m_cms.increment(name);
-  NFD_LOG_INFO("CMS-INC " << name);
 
   // 2. Probabilistic cache admission (θ_cache)
   double theta = m_defaultTheta;
@@ -97,23 +203,21 @@ void CustomStrategy::beforeSatisfyInterest(const ndn::Data&                   da
     theta = it->second;
 
   if (m_uni(m_rng) < theta) {
-    uint64_t estNew = m_cms.estimate(name);
+    uint64_t estNew  = m_cms.estimate(name);
     auto     dataPtr = std::make_shared<ndn::Data>(data);
 
     if (!m_slru.isFull()) {
       m_slru.insert(name, dataPtr);
-      NFD_LOG_INFO("SLRU-ADMIT " << name);
+      addEnergy(E_CACHE_INSERT);                // Energy: cache insert cost
     }
     else {
       ndn::Name victim    = m_slru.selectVictim();
       uint64_t  estVictim = m_cms.estimate(victim);
 
-      NFD_LOG_INFO("CMS-COMP victim=" << victim << " est=" << estVictim
-                    << " | new=" << name << " est=" << estNew);
-
-      if (estVictim < estNew) {
+      if (estVictim <= estNew) {
         m_slru.insert(name, dataPtr);
-        NFD_LOG_INFO("SLRU-ADMIT " << name);
+        addEnergy(E_CACHE_INSERT);              // Energy: cache insert cost
+        // Eviction counter is incremented inside slru.cpp
       }
     }
   }
@@ -152,7 +256,7 @@ void CustomStrategy::receiveFogInstruction(const ndn::Data& inst)
 }
 
 // ---------------------------------------------------------------------------
-//  Periodic access report
+//  Periodic access report (unchanged)
 // ---------------------------------------------------------------------------
 void CustomStrategy::scheduleNextReport()
 {

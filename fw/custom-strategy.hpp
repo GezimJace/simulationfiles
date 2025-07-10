@@ -39,8 +39,7 @@ public:
   void beforeSatisfyInterest(const ndn::Data& data,
                            const nfd::FaceEndpoint& ingress,
                            const std::shared_ptr<nfd::pit::Entry>& pitEntry) override;
-
-
+  
 private:
   // ---- SLRU + CMS structures --------------------------------------------
   CountMinSketch           m_cms;

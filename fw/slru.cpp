@@ -1,4 +1,8 @@
+// slru.cpp — SLRU cache with integrated statistics
+// (hits & evictions now update the shared g_cacheStats counters)
+
 #include "slru.hpp"
+#include "cache-stats.hpp"              // shared stats struct
 #include "NFD/daemon/common/logger.hpp"
 #include <cassert>
 
@@ -6,6 +10,7 @@ NFD_LOG_INIT(slru);
 
 using ndn::Name;
 using ndn::Data;
+using nfd::fw::g_cacheStats;             // shorthand
 
 SlruCache::SlruCache(size_t probationCap, size_t protectedCap)
   : m_capProb(probationCap)
@@ -39,12 +44,14 @@ SlruCache::ensureCaps()
       Name victim = m_probList.back();
       m_probList.pop_back();
       m_store.erase(victim);
-      NFD_LOG_INFO("SLRU-EVICT " << victim); // ✔ instrumentation
+      ++g_cacheStats.evictions;              // count every removal
+      NFD_LOG_INFO("SLRU-EVICT " << victim);
     }
     else if (!m_protList.empty()) {
       Name victim = m_protList.back();
       m_protList.pop_back();
       m_store.erase(victim);
+      ++g_cacheStats.evictions;
       NFD_LOG_INFO("SLRU-EVICT " << victim);
     }
   }
@@ -82,7 +89,7 @@ SlruCache::insert(const Name& name, const DataPtr& data)
   if (it != m_store.end()) {
     it->second.first = data;
     fetch(name);                  // refresh position
-    NFD_LOG_INFO("SLRU-INSERT " << name); 
+    NFD_LOG_INFO("SLRU-INSERT " << name);
     return true;
   }
 
@@ -112,7 +119,9 @@ SlruCache::fetch(const Name& name)
     m_protList.push_front(name);             // move to MRU
     it->second.second = m_protList.begin();
   }
-  NFD_LOG_INFO("SLRU-HIT   " << name); 
+
+  ++g_cacheStats.hits;                       // record hit
+  NFD_LOG_INFO("SLRU-HIT   " << name);
   return it->second.first;
 }
 
